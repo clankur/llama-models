@@ -31,31 +31,9 @@ model = Transformer(model_args)
 weights = torch.load(
     f"{model_path}/consolidated.00.pth", map_location=torch.device("cpu")
 )
-
+model.load_state_dict(weights)
 weights
 # %%
-model.load_state_dict(weights)
-# %%
-"""
-    [
-        "tok_embeddings.weight",
-        "layers.X.attention.wq.weight",
-        "layers.X.attention.wk.weight",
-        "layers.X.attention.wv.weight",
-        "layers.X.attention.wo.weight",
-        "layers.X.feed_forward.w1.weight",
-        "layers.X.feed_forward.w3.weight",
-        "layers.X.feed_forward.w2.weight",
-        "layers.X.attention_norm.weight",
-        "layers.X.ffn_norm.weight",
-        "norm.weight",
-        "output.weight",
-    ]
-"""
-
-
-# %%
-
 hidden_dim = 4 * model_args.dim
 hidden_dim = int(2 * hidden_dim / 3)
 hidden_dim = int(model_args.ffn_dim_multiplier * hidden_dim)
@@ -76,8 +54,13 @@ class Hparams:
     norm_eps: float = model_args.norm_eps
 
 
-def load_llama(weights, h: Hparams):
+# %%
 
+h = Hparams
+# %%
+
+
+def load_llama(weights, h: Hparams):
     pre_attention_norms = []
     pre_ffw_norms = []
     attn_qs = []
@@ -87,30 +70,48 @@ def load_llama(weights, h: Hparams):
     mlp_ups = []
     mlp_downs = []
 
-    embed = weights["tok_embeddings.weight"].numpy()
-    unembed = weights["tok_embeddings.weight"].numpy()
+    # Convert weights to JAX arrays
+    embed = jnp.array(
+        weights["tok_embeddings.weight"].float().numpy(), dtype=jnp.float32
+    )
+    unembed = jnp.array(
+        weights["tok_embeddings.weight"].float().numpy(), dtype=jnp.float32
+    )
 
     # Loop through each layer to load weights
     for layer_id in range(16):  # Adjust the range to match your model layers
         # norms
-        ln1 = weights[f"layers.{layer_id}.attention_norm.weight"].numpy()
-        ln2 = weights[f"layers.{layer_id}.ffn_norm.weight"].numpy()
+        ln1 = jnp.array(
+            weights[f"layers.{layer_id}.attention_norm.weight"].float().numpy(),
+            dtype=jnp.float32,
+        )
+        ln2 = jnp.array(
+            weights[f"layers.{layer_id}.ffn_norm.weight"].float().numpy(),
+            dtype=jnp.float32,
+        )
         pre_attention_norms.append(ln1)
         pre_ffw_norms.append(ln2)
 
         # attention weights
-        w_q = weights[f"layers.{layer_id}.attention.wq.weight"].numpy()
+        w_q = jnp.array(
+            weights[f"layers.{layer_id}.attention.wq.weight"].float().numpy(),
+            dtype=jnp.float32,
+        )
 
         w_q = rearrange(
             w_q,
-            "(n_kv n_q_per_kv) d_model d_head -> d_model n_kv n_q_per_kv d_head",
+            "(n_kv n_q_per_kv d_head) d_model -> d_model n_kv n_q_per_kv d_head",
             n_q_per_kv=h.n_q_per_kv,
             n_kv=h.n_kv,
+            d_head=h.d_head,
         )  # d_model n_kv n_q_per_kv d_head
 
         attn_qs.append(w_q)
 
-        w_k = weights[f"layers.{layer_id}.attention.wk.weight"].numpy()
+        w_k = jnp.array(
+            weights[f"layers.{layer_id}.attention.wk.weight"].float().numpy(),
+            dtype=jnp.float32,
+        )
 
         # rearranging dims like n_kv can cause issues!
         w_k = rearrange(
@@ -120,7 +121,10 @@ def load_llama(weights, h: Hparams):
             d_head=h.d_head,
         )  # M_dim n_kv H_dim
 
-        w_v = weights[f"layers.{layer_id}.attention.wv.weight"].numpy()
+        w_v = jnp.array(
+            weights[f"layers.{layer_id}.attention.wv.weight"].float().numpy(),
+            dtype=jnp.float32,
+        )
 
         w_v = rearrange(
             w_v,
@@ -128,44 +132,97 @@ def load_llama(weights, h: Hparams):
             n_kv=h.n_kv,
             d_head=h.d_head,
         )  # M_dim n_kv H_dim
-        w_kv = np.stack([w_k, w_v], axis=0)
+        w_kv = jnp.stack([w_k, w_v], axis=0)
         attn_kvs.append(w_kv)
 
-        w_o = weights[f"layers.{layer_id}.attention.wo.weight"].numpy()
+        w_o = jnp.array(
+            weights[f"layers.{layer_id}.attention.wo.weight"].float().numpy(),
+            dtype=jnp.float32,
+        )
         w_o = rearrange(
             w_o,
             "(n_q_per_kv n_kv d_head) d_model -> d_model n_q_per_kv n_kv d_head",
+            n_q_per_kv=h.n_q_per_kv,
+            n_kv=h.n_kv,
+            d_head=h.d_head,
         )  # "d_model/d n_q_per_kv n_kv/t d_head"
         attn_os.append(w_o)
 
         # mlp
-        w_gate = weights[f"layers.{layer_id}.feed_forward.w1.weight"].numpy()
+        w_gate = jnp.array(
+            weights[f"layers.{layer_id}.feed_forward.w1.weight"].float().numpy(),
+            dtype=jnp.float32,
+        )
         w_gate = rearrange(w_gate, "d_ff d_model -> d_model d_ff")
         mlp_gates.append(w_gate)
 
-        w_up = weights[f"layers.{layer_id}.feed_forward.w3.weight"].numpy()
+        w_up = jnp.array(
+            weights[f"layers.{layer_id}.feed_forward.w3.weight"].float().numpy(),
+            dtype=jnp.float32,
+        )
         w_up = rearrange(w_up, "d_ff d_model -> d_model d_ff")
         mlp_ups.append(w_up)
 
-        w_down = weights[f"layers.{layer_id}.feed_forward.w2.weight"].numpy()
+        w_down = jnp.array(
+            weights[f"layers.{layer_id}.feed_forward.w2.weight"].float().numpy(),
+            dtype=jnp.float32,
+        )
         mlp_downs.append(w_down)
 
+    # Stack all lists along the first dimension (number of layers)
+    pre_attention_norms = jnp.stack(pre_attention_norms, axis=0)
+    pre_ffw_norms = jnp.stack(pre_ffw_norms, axis=0)
+    attn_qs = jnp.stack(attn_qs, axis=0)
+    attn_kvs = jnp.stack(attn_kvs, axis=0)
+    attn_os = jnp.stack(attn_os, axis=0)
+    mlp_gates = jnp.stack(mlp_gates, axis=0)
+    mlp_ups = jnp.stack(mlp_ups, axis=0)
+    mlp_downs = jnp.stack(mlp_downs, axis=0)
+
+    return (
+        embed,
+        unembed,
+        pre_attention_norms,
+        pre_ffw_norms,
+        attn_qs,
+        attn_kvs,
+        attn_os,
+        mlp_gates,
+        mlp_ups,
+        mlp_downs,
+    )
+
 
 # %%
-
-# %%
-h = Hparams()
+(
+    embed,
+    unembed,
+    pre_attention_norms,
+    pre_ffw_norms,
+    attn_qs,
+    attn_kvs,
+    attn_os,
+    mlp_gates,
+    mlp_ups,
+    mlp_downs,
+) = load_llama(weights, h)
 
 
 # %%
 def compare_tensors(
-    tensor1: jax.Array, tensor2: jax.Array, tolerance: float = 1e-5
+    tensor1: jax.Array, tensor2: torch.Tensor, tolerance: float = 1e-5
 ) -> tuple[bool, bool]:
+    # Convert the torch tensor to a jax array
+    tensor2 = jnp.array(tensor2.cpu().numpy())
+
+    # Check if shapes are the same
     if tensor1.shape != tensor2.shape:
         return False, False
 
+    # Check for exact match
     exact_match = jnp.array_equal(tensor1, tensor2)
 
+    # Check for approximate match
     max_diff = jnp.max(jnp.abs(tensor1 - tensor2))
     approximate_match = max_diff <= tolerance
 
@@ -198,7 +255,7 @@ class RopeTable:
 
 
 # %%
-L = seq_length
+L = 5
 h = Hparams()
 K_MASK = -2.3819763e38
 rope_table = RopeTable(seq_length, h)
