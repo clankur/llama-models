@@ -63,6 +63,14 @@ class ModelArgs:
 # dependencies. These dependencies are not part of the default dependencies
 # (requirements.txt) of the `llama-models` package.
 
+intermediates = {}
+
+
+def hook_fn(name, tensor):
+    if name not in intermediates:
+        intermediates[name] = []
+    intermediates[name].append(tensor.detach().clone())
+
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -75,6 +83,8 @@ class RMSNorm(torch.nn.Module):
 
     def forward(self, x):
         output = self._norm(x.float()).type_as(x)
+        hook_fn("rms_norm_output", output)
+
         return output * self.weight
 
 
@@ -211,8 +221,13 @@ class Attention(nn.Module):
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        hook_fn("wq", xq)
+        hook_fn("xk", xk)
+        hook_fn("xv", xv)
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        hook_fn("xq_roped", xq)
+        hook_fn("xk_roped", xk)
 
         self.cache_k = self.cache_k.to(xq)
         self.cache_v = self.cache_v.to(xq)
@@ -237,11 +252,14 @@ class Attention(nn.Module):
             1, 2
         )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        hook_fn("scores", scores)
+
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        hook_fn("output", output)
         return self.wo(output)
 
 
@@ -277,7 +295,16 @@ class FeedForward(nn.Module):
         )
 
     def forward(self, x):
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        gate_proj = self.w1(x)
+        hook_fn("gate_proj", gate_proj)
+
+        up_proj = self.w3(x)
+        hook_fn("up_proj", up_proj)
+
+        ffn_out = self.w2(F.silu(gate_proj) * up_proj)
+        hook_fn("ffn_output", ffn_out)
+
+        return ffn_out
 
 
 class TransformerBlock(nn.Module):
@@ -370,4 +397,4 @@ class Transformer(nn.Module):
             h = layer(h, start_pos, freqs_cis, mask)
         h = self.norm(h)
         output = self.output(h).float()
-        return output
+        return output, intermediates
