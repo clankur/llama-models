@@ -14,14 +14,50 @@ from typing import Optional, Tuple
 import fairscale.nn.model_parallel.initialize as fs_init
 import torch
 import torch.nn.functional as F
-from fairscale.nn.model_parallel.layers import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-    VocabParallelEmbedding,
-)
+
+# from fairscale.nn.model_parallel.layers import (
+#     ColumnParallelLinear,
+#     RowParallelLinear,
+#     VocabParallelEmbedding,
+# )
 from torch import nn
 
-from ..api import ModelArgs
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass
+class ModelArgs:
+    dim: int = 4096
+    n_layers: int = 32
+    n_heads: int = 32
+    n_kv_heads: Optional[int] = None
+    vocab_size: int = -1
+    multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
+    ffn_dim_multiplier: Optional[float] = None
+    norm_eps: float = 1e-5
+    rope_theta: float = 500000
+    use_scaled_rope: bool = False
+
+    max_batch_size: int = 32
+    max_seq_len: int = 2048
+
+    # vision model params
+    vision_chunk_size: int = -1  # image resolution for image models
+    vision_max_num_chunks: int = 4
+    vision_num_cross_attention_layers: int = -1
+
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            if hasattr(self, k):
+                setattr(self, k, v)
+
+        if self.n_kv_heads is None:
+            self.n_kv_heads = self.n_heads
+        assert self.n_kv_heads <= self.n_heads
+        assert self.n_heads % self.n_kv_heads == 0
+        assert self.dim % self.n_heads == 0
+
 
 # **NOTE**: This code is not runnable without installing `torch` and `fairscale`
 # dependencies. These dependencies are not part of the default dependencies
@@ -116,39 +152,30 @@ class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
-        model_parallel_size = fs_init.get_model_parallel_world_size()
-        self.n_local_heads = args.n_heads // model_parallel_size
-        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
+        self.n_local_heads = args.n_heads
+        self.n_local_kv_heads = self.n_kv_heads
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
 
-        self.wq = ColumnParallelLinear(
+        self.wq = torch.nn.Linear(
             args.dim,
             args.n_heads * self.head_dim,
             bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
         )
-        self.wk = ColumnParallelLinear(
+        self.wk = torch.nn.Linear(
             args.dim,
             self.n_kv_heads * self.head_dim,
             bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
         )
-        self.wv = ColumnParallelLinear(
+        self.wv = torch.nn.Linear(
             args.dim,
             self.n_kv_heads * self.head_dim,
             bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
         )
-        self.wo = RowParallelLinear(
+        self.wo = torch.nn.Linear(
             args.n_heads * self.head_dim,
             args.dim,
             bias=False,
-            input_is_parallel=True,
-            init_method=lambda x: x,
         )
 
         self.cache_k = torch.zeros(
@@ -158,7 +185,7 @@ class Attention(nn.Module):
                 self.n_local_kv_heads,
                 self.head_dim,
             )
-        ).cuda()
+        )
         self.cache_v = torch.zeros(
             (
                 args.max_batch_size,
@@ -166,7 +193,10 @@ class Attention(nn.Module):
                 self.n_local_kv_heads,
                 self.head_dim,
             )
-        ).cuda()
+        )
+
+        if torch.cuda.is_available():
+            self.cache_k, self.cache_v = self.cache_k.cuda(), self.cache_v.cuda()
 
     def forward(
         self,
@@ -230,14 +260,20 @@ class FeedForward(nn.Module):
             hidden_dim = int(ffn_dim_multiplier * hidden_dim)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
-        self.w1 = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
+        self.w1 = torch.nn.Linear(
+            dim,
+            hidden_dim,
+            bias=False,
         )
-        self.w2 = RowParallelLinear(
-            hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
+        self.w2 = torch.nn.Linear(
+            hidden_dim,
+            dim,
+            bias=False,
         )
-        self.w3 = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
+        self.w3 = torch.nn.Linear(
+            dim,
+            hidden_dim,
+            bias=False,
         )
 
     def forward(self, x):
@@ -280,8 +316,9 @@ class Transformer(nn.Module):
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
 
-        self.tok_embeddings = VocabParallelEmbedding(
-            params.vocab_size, params.dim, init_method=lambda x: x
+        self.tok_embeddings = torch.nn.Embedding(
+            params.vocab_size,
+            params.dim,
         )
 
         self.layers = torch.nn.ModuleList()
@@ -289,8 +326,10 @@ class Transformer(nn.Module):
             self.layers.append(TransformerBlock(layer_id, params))
 
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
-        self.output = ColumnParallelLinear(
-            params.dim, params.vocab_size, bias=False, init_method=lambda x: x
+        self.output = torch.nn.Linear(
+            params.dim,
+            params.vocab_size,
+            bias=False,
         )
 
         self.freqs_cis = precompute_freqs_cis(
@@ -314,9 +353,9 @@ class Transformer(nn.Module):
             mask = torch.triu(mask, diagonal=1)
 
             # https://github.com/pytorch/pytorch/issues/100005
-            # torch.triu is buggy when the device is mps: filled values are 
-            # nan instead of 0. 
-            if mask.device.type == torch.device('mps').type:
+            # torch.triu is buggy when the device is mps: filled values are
+            # nan instead of 0.
+            if mask.device.type == torch.device("mps").type:
                 mask = torch.nan_to_num(mask, nan=0.0)
 
             # When performing key-value caching, we compute the attention scores
