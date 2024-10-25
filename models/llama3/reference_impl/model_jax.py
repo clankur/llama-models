@@ -1,9 +1,10 @@
 # %%
 import torch
 import numpy as np
+import jax
+from dlpack import asdlpack
 from jax.sharding import Mesh
 import jax.numpy as jnp
-import jax
 from einops import rearrange, einsum
 import json
 import os
@@ -71,31 +72,24 @@ def load_llama(weights, h: Hparams):
     mlp_downs = []
 
     # Convert weights to JAX arrays
-    embed = jnp.array(
-        weights["tok_embeddings.weight"].float().numpy(), dtype=jnp.float32
-    )
-    unembed = jnp.array(
-        weights["tok_embeddings.weight"].float().numpy(), dtype=jnp.float32
-    )
+    embed = jnp.from_dlpack(asdlpack(weights["tok_embeddings.weight"].float()))
+    unembed = jnp.from_dlpack(asdlpack(weights["tok_embeddings.weight"].float()))
 
     # Loop through each layer to load weights
     for layer_id in range(16):  # Adjust the range to match your model layers
         # norms
-        ln1 = jnp.array(
-            weights[f"layers.{layer_id}.attention_norm.weight"].float().numpy(),
-            dtype=jnp.float32,
+        ln1 = jnp.from_dlpack(
+            asdlpack(weights[f"layers.{layer_id}.attention_norm.weight"].float())
         )
-        ln2 = jnp.array(
-            weights[f"layers.{layer_id}.ffn_norm.weight"].float().numpy(),
-            dtype=jnp.float32,
+        ln2 = jnp.from_dlpack(
+            asdlpack(weights[f"layers.{layer_id}.ffn_norm.weight"].float())
         )
         pre_attention_norms.append(ln1)
         pre_ffw_norms.append(ln2)
 
         # attention weights
-        w_q = jnp.array(
-            weights[f"layers.{layer_id}.attention.wq.weight"].float().numpy(),
-            dtype=jnp.float32,
+        w_q = jnp.from_dlpack(
+            asdlpack(weights[f"layers.{layer_id}.attention.wq.weight"].float()),
         )
 
         w_q = rearrange(
@@ -108,9 +102,8 @@ def load_llama(weights, h: Hparams):
 
         attn_qs.append(w_q)
 
-        w_k = jnp.array(
-            weights[f"layers.{layer_id}.attention.wk.weight"].float().numpy(),
-            dtype=jnp.float32,
+        w_k = jnp.from_dlpack(
+            asdlpack(weights[f"layers.{layer_id}.attention.wk.weight"].float()),
         )
 
         # rearranging dims like n_kv can cause issues!
@@ -121,9 +114,8 @@ def load_llama(weights, h: Hparams):
             d_head=h.d_head,
         )  # M_dim n_kv H_dim
 
-        w_v = jnp.array(
-            weights[f"layers.{layer_id}.attention.wv.weight"].float().numpy(),
-            dtype=jnp.float32,
+        w_v = jnp.from_dlpack(
+            asdlpack(weights[f"layers.{layer_id}.attention.wv.weight"].float()),
         )
 
         w_v = rearrange(
@@ -135,9 +127,8 @@ def load_llama(weights, h: Hparams):
         w_kv = jnp.stack([w_k, w_v], axis=0)
         attn_kvs.append(w_kv)
 
-        w_o = jnp.array(
-            weights[f"layers.{layer_id}.attention.wo.weight"].float().numpy(),
-            dtype=jnp.float32,
+        w_o = jnp.from_dlpack(
+            asdlpack(weights[f"layers.{layer_id}.attention.wo.weight"].float()),
         )
         w_o = rearrange(
             w_o,
@@ -149,23 +140,20 @@ def load_llama(weights, h: Hparams):
         attn_os.append(w_o)
 
         # mlp
-        w_gate = jnp.array(
-            weights[f"layers.{layer_id}.feed_forward.w1.weight"].float().numpy(),
-            dtype=jnp.float32,
+        w_gate = jnp.from_dlpack(
+            asdlpack(weights[f"layers.{layer_id}.feed_forward.w1.weight"].float()),
         )
         w_gate = rearrange(w_gate, "d_ff d_model -> d_model d_ff")
         mlp_gates.append(w_gate)
 
-        w_up = jnp.array(
-            weights[f"layers.{layer_id}.feed_forward.w3.weight"].float().numpy(),
-            dtype=jnp.float32,
+        w_up = jnp.from_dlpack(
+            asdlpack(weights[f"layers.{layer_id}.feed_forward.w3.weight"].float()),
         )
         w_up = rearrange(w_up, "d_ff d_model -> d_model d_ff")
         mlp_ups.append(w_up)
 
-        w_down = jnp.array(
-            weights[f"layers.{layer_id}.feed_forward.w2.weight"].float().numpy(),
-            dtype=jnp.float32,
+        w_down = jnp.from_dlpack(
+            asdlpack(weights[f"layers.{layer_id}.feed_forward.w2.weight"].float()),
         )
         mlp_downs.append(w_down)
 
@@ -298,25 +286,32 @@ w_q, w_kv, w_o, w_gate, w_up, w_down, ln1, ln2 = (
 )
 
 # %%
-print("initial carry dtype \n", x.dtype)
 print(intermediates["nx"][0].shape)
 nx = rms_norm(x) * ln1
 print(compare_tensors(nx, intermediates["nx"][0].float()))
 
 # %%
-q = jnp.einsum(
-    "btm,knhm->btknh",
+w_q_compare = rearrange(
+    w_q, "n_kv n_q_per_kv d_head d_model -> (n_kv n_q_per_kv d_head) d_model"
+)
+print(
+    compare_tensors(
+        w_q_compare,
+        model.layers[0].attention.wq.weight.float(),
+    ),
+)
+# %%
+q = einsum(
     nx,
     w_q,
+    "B Qlen d_model, n_kv n_q_per_kv d_head d_model -> B Qlen n_kv n_q_per_kv d_head",
 ).astype(x)
-k, v = jnp.einsum(
-    "btm,vmkh->vbtkh",
-    nx,
-    w_kv,
+k, v = einsum(
+    nx, w_kv, "B Klen d_model, k_v d_model n_kv d_head -> k_v B Klen n_kv d_head"
 ).astype(x)
 
 q_compare = rearrange(
-    q, "B Qlen n_kv n_q_per_kv d_head -> B Qlen ( n_kv n_q_per_kv ) d_head"
+    q, "B Qlen n_kv n_q_per_kv d_head -> B Qlen (n_kv n_q_per_kv) d_head"
 )
 print(
     compare_tensors(
