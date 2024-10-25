@@ -201,18 +201,19 @@ def compare_tensors(
     tensor1: jax.Array, tensor2: torch.Tensor, tolerance: float = 1e-5
 ) -> tuple[bool, bool]:
     # Convert the torch tensor to a jax array
-    print(f"{tensor1.dtype}, {tensor2.dtype=}")
-    tensor2 = jnp.array(tensor2.detach().cpu().numpy()).astype(tensor1)
+    print(f"{tensor1.dtype=}, {tensor2.dtype=}")
+    tensor1 = np.from_dlpack(asdlpack(tensor1))
+    tensor2 = np.from_dlpack(asdlpack(tensor2))
 
     # Check if shapes are the same
     if tensor1.shape != tensor2.shape:
         return False, False
 
     # Check for exact match
-    exact_match = jnp.array_equal(tensor1, tensor2)
+    exact_match = np.array_equal(tensor1, tensor2)
 
     # Check for approximate match
-    max_diff = jnp.max(jnp.abs(tensor1 - tensor2))
+    max_diff = np.max(np.abs(tensor1 - tensor2))
     print(f"{ max_diff= }")
     approximate_match = max_diff <= tolerance
 
