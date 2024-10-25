@@ -83,7 +83,6 @@ class RMSNorm(torch.nn.Module):
 
     def forward(self, x):
         output = self._norm(x.float()).type_as(x)
-        hook_fn("rms_norm_output", output)
 
         return output * self.weight
 
@@ -217,11 +216,10 @@ class Attention(nn.Module):
     ):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-        hook_fn("wq", xq)
+        hook_fn("xq", xq)
         hook_fn("xk", xk)
         hook_fn("xv", xv)
 
@@ -331,7 +329,9 @@ class TransformerBlock(nn.Module):
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
     ):
-        h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
+        nx = self.attention_norm(x)
+        hook_fn("nx", nx)
+        h = x + self.attention(nx, start_pos, freqs_cis, mask)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 

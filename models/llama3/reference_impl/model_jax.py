@@ -100,7 +100,7 @@ def load_llama(weights, h: Hparams):
 
         w_q = rearrange(
             w_q,
-            "(n_kv n_q_per_kv d_head) d_model -> d_model n_kv n_q_per_kv d_head",
+            "(n_kv n_q_per_kv d_head) d_model  -> n_kv n_q_per_kv d_head d_model",
             n_q_per_kv=h.n_q_per_kv,
             n_kv=h.n_kv,
             d_head=h.d_head,
@@ -213,7 +213,8 @@ def compare_tensors(
     tensor1: jax.Array, tensor2: torch.Tensor, tolerance: float = 1e-5
 ) -> tuple[bool, bool]:
     # Convert the torch tensor to a jax array
-    tensor2 = jnp.array(tensor2.cpu().numpy())
+    print(f"{tensor1.dtype}, {tensor2.dtype=}")
+    tensor2 = jnp.array(tensor2.detach().cpu().numpy()).astype(tensor1)
 
     # Check if shapes are the same
     if tensor1.shape != tensor2.shape:
@@ -224,6 +225,7 @@ def compare_tensors(
 
     # Check for approximate match
     max_diff = jnp.max(jnp.abs(tensor1 - tensor2))
+    print(f"{ max_diff= }")
     approximate_match = max_diff <= tolerance
 
     return exact_match, approximate_match
@@ -283,10 +285,6 @@ ids = jnp_dummy_input
 x = embed[ids]
 print(compare_tensors(x, intermediates["tracked_embed"][0]))
 
-# %%
-x *= jnp.sqrt(h.d_model)
-
-# %%
 # def loop_body(carry, layer_weights):
 w_q, w_kv, w_o, w_gate, w_up, w_down, ln1, ln2 = (
     attn_qs[0],
@@ -300,29 +298,40 @@ w_q, w_kv, w_o, w_gate, w_up, w_down, ln1, ln2 = (
 )
 
 # %%
-
-# jax.debug.print("layer {i} \n", i=i)
 print("initial carry dtype \n", x.dtype)
+print(intermediates["nx"][0].shape)
+nx = rms_norm(x) * ln1
+print(compare_tensors(nx, intermediates["nx"][0].float()))
 
-nx = rms_norm(x) * (1.0 + ln1)
-jax.debug.print(
-    "normed x alignment={b}",
-    b=compare_tensors(nx, intermediates["pre_attention_norm"][i]),
+# %%
+q = jnp.einsum(
+    "btm,knhm->btknh",
+    nx,
+    w_q,
+).astype(x)
+k, v = jnp.einsum(
+    "btm,vmkh->vbtkh",
+    nx,
+    w_kv,
+).astype(x)
+
+q_compare = rearrange(
+    q, "B Qlen n_kv n_q_per_kv d_head -> B Qlen ( n_kv n_q_per_kv ) d_head"
+)
+print(
+    compare_tensors(
+        q_compare,
+        intermediates["xq"][0].float(),
+    ),
+)
+print(
+    compare_tensors(
+        k,
+        intermediates["xk"][0].float(),
+    ),
 )
 
 # %%
-
-# realigning
-# nx = intermediates['pre_attention_norm'][i]
-
-q = einsum(
-    nx,
-    w_q,
-    "B Qlen d_model, d_model n_kv n_q_per_kv d_head -> B Qlen n_kv n_q_per_kv d_head",
-).astype(x)
-k, v = einsum(
-    nx, w_kv, "B Klen d_model, k_v d_model n_kv d_head -> k_v B Klen n_kv d_head"
-).astype(x)
 
 q = rope_table.apply("L d -> 1 L 1 1 d", q)
 k = rope_table.apply("L d -> 1 L 1 d", k)
