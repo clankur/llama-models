@@ -51,7 +51,7 @@ class Hparams:
     layers: int = model_args.n_layers
     vocab: int = model_args.vocab_size
     d_ff: int = hidden_dim
-    rope_max_timescale: int = model_args.rope_theta  # not sure
+    rope_max_timescale: int = model_args.rope_theta
     norm_eps: float = model_args.norm_eps
 
 
@@ -198,26 +198,30 @@ def load_llama(weights, h: Hparams):
 
 # %%
 def compare_tensors(
-    tensor1: jax.Array, tensor2: torch.Tensor, tolerance: float = 1e-5
+    tensor1: jax.Array | torch.Tensor,
+    tensor2: jax.Array | torch.Tensor,
+    tolerance: float = 2e-5,
 ) -> tuple[bool, bool]:
     # Convert the torch tensor to a jax array
+
     print(f"{tensor1.dtype=}, {tensor2.dtype=}")
-    tensor1 = np.from_dlpack(asdlpack(tensor1))
-    tensor2 = np.from_dlpack(asdlpack(tensor2))
+    tensor1 = torch.from_dlpack(asdlpack(tensor1))
+    tensor2 = torch.from_dlpack(asdlpack(tensor2))
 
     # Check if shapes are the same
     if tensor1.shape != tensor2.shape:
         return False, False
 
     # Check for exact match
-    exact_match = np.array_equal(tensor1, tensor2)
+    exact_match = torch.equal(tensor1, tensor2)
 
     # Check for approximate match
-    max_diff = np.max(np.abs(tensor1 - tensor2))
+    max_diff = torch.max(torch.abs(tensor1 - tensor2))
+
     print(f"{ max_diff= }")
     approximate_match = max_diff <= tolerance
 
-    return exact_match, approximate_match
+    return exact_match, approximate_match.item()
 
 
 def rms_norm(x):
@@ -228,20 +232,29 @@ def rms_norm(x):
 class RopeTable:
     def __init__(self, max_len: int, h: Hparams) -> None:
         head_dim = h.d_head
-        position = jnp.arange(max_len, dtype=jnp.int32)
-        fraction = 2 * jnp.arange(0, head_dim // 2) / head_dim
-        timescale = h.rope_max_timescale**fraction
+        timescale = 1.0 / (
+            h.rope_max_timescale
+            ** (jnp.arange(0, head_dim, 2)[: (head_dim // 2)] / head_dim)
+        )
+        position = jnp.arange(max_len, dtype=jnp.float32)
+        # need to add scaling to 1.0/timescale here
 
-        sinusoid_inp = jnp.float32(position[:, jnp.newaxis]) / timescale[jnp.newaxis, :]
+        # sinusoid_inp = jnp.float32(position[:, jnp.newaxis]) / timescale[jnp.newaxis, :]
+        sinusoid_inp = jnp.outer(position, timescale)
+
         self.sin = jnp.sin(sinusoid_inp)
         self.cos = jnp.cos(sinusoid_inp)
+        self.freqs_cis = jnp.ones_like(sinusoid_inp) * (
+            jnp.cos(sinusoid_inp) + 1j * jnp.sin(sinusoid_inp)
+        )
 
     def apply(self, rearrange_spec, x):
         x1, x2 = jnp.split(x, 2, axis=-1)
-        sin = rearrange(self.sin, rearrange_spec)
-        cos = rearrange(self.cos, rearrange_spec)
-        r1 = x1 * cos - x2 * sin
-        r2 = x2 * cos + x1 * sin
+        # sin = rearrange(self.sin, rearrange_spec)
+        # cos = rearrange(self.cos, rearrange_spec)
+        # r1 = x1 * cos - x2 * sin
+        # r2 = x2 * cos + x1 * sin
+
         return jnp.concatenate([r1, r2], axis=-1).astype(x.dtype)
 
 
@@ -249,7 +262,6 @@ class RopeTable:
 L = 5
 h = Hparams()
 K_MASK = -2.3819763e38
-# rope_table = RopeTable(seq_length, h)
 # use_local_window_attn = False
 # causal_mask = jnp.tril(jnp.ones((batch_size, L, L), dtype=jnp.bool_), 0)[
 #     ..., jnp.newaxis, jnp.newaxis, :
@@ -260,11 +272,18 @@ K_MASK = -2.3819763e38
 
 # %%
 batch_size = 1
-seq_length = 5  # tokens.targets.shape[-1]
+seq_length = 2048  # tokens.targets.shape[-1]
 
 dummy_input = np.zeros((batch_size, seq_length))
 jnp_dummy_input = dummy_input.astype(jnp.int32)
 torch_dummy_input = torch.from_numpy(dummy_input).long()
+
+rope_table = RopeTable(2048 * 2, h)
+# %%
+rope_table.freqs_cis.shape, model.freqs_cis.shape, compare_tensors(
+    rope_table.freqs_cis.astype(jnp.float32), model.freqs_cis.float()
+)
+
 # %%
 output, intermediates = model.forward(torch_dummy_input, 0)
 output, intermediates
@@ -298,15 +317,15 @@ w_q_compare = rearrange(
 print(
     compare_tensors(
         w_q_compare,
-        model.layers[0].attention.wq.weight.float(),
+        model.layers[0].attention.wq.weight.detach().bfloat16(),
     ),
 )
 # %%
 q = einsum(
     nx,
-    w_q,
+    w_q,  # torch.from_dlpack(asdlpack
     "B Qlen d_model, n_kv n_q_per_kv d_head d_model -> B Qlen n_kv n_q_per_kv d_head",
-).astype(x)
+)
 k, v = einsum(
     nx, w_kv, "B Klen d_model, k_v d_model n_kv d_head -> k_v B Klen n_kv d_head"
 ).astype(x)
@@ -331,16 +350,17 @@ print(
 
 q = rope_table.apply("L d -> 1 L 1 1 d", q)
 k = rope_table.apply("L d -> 1 L 1 d", k)
+q_compare = rearrange(
+    q, "B Qlen n_kv n_q_per_kv d_head -> B Qlen (n_kv n_q_per_kv) d_head"
+)
+print(compare_tensors(q_compare, intermediates["xq_roped"][i]))
+print(compare_tensors(k, intermediates["xk_roped"][i]))
+
 q_preatt_scalar = h.d_head**-0.5
 q_scaled = q * q_preatt_scalar
 
-jax.debug.print(
-    "roped_q alignment = {b}",
-    b=compare_tensors(q_scaled, intermediates["reshaped_scaled_q"][i]),
-)
-jax.debug.print(
-    "roped_k alignment = {b}", b=compare_tensors(k, intermediates["roped_k"][i])
-)
+
+# %%
 
 logits = einsum(
     q_scaled,
