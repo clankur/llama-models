@@ -249,7 +249,7 @@ class RopeTable:
     def apply(self, rearrange_spec, x, start_pos=0):
         x_complex = jnp.reshape(x.astype(jnp.float32), (*x.shape[:-1], -1, 2))
 
-        x_complex = x_complex[0] + x_complex[1] * 1j
+        x_complex = x_complex[..., 0] + x_complex[..., 1] * 1j
         freqs_cis = rearrange(self.freqs_cis, rearrange_spec)[
             :, start_pos : start_pos + x.shape[1], ...
         ]
@@ -384,7 +384,6 @@ compare_tensors(q_out_jax, q_out_torch)
 # %%
 q = rope_table.apply("L d -> 1 L 1 1 d", q)
 k = rope_table.apply("L d -> 1 L 1 d", k)
-# %%
 q_compare = rearrange(
     q, "B Qlen n_kv n_q_per_kv d_head -> B Qlen (n_kv n_q_per_kv) d_head"
 )
