@@ -307,9 +307,9 @@ w_q, w_kv, w_o, w_gate, w_up, w_down, ln1, ln2 = (
 )
 
 # %%
-print(intermediates["nx"][0].shape)
+print(intermediates["pre_attn_norm"][0].shape)
 nx = rms_norm(x) * ln1
-print(compare_tensors(nx, intermediates["nx"][0].float()))
+print(compare_tensors(nx, intermediates["pre_attn_norm"][0].float()))
 
 # %%
 w_q_compare = rearrange(
@@ -392,40 +392,31 @@ attn_out_prime = einsum(
     w_o,
     "B Qlen n_kv n_q_per_kv d_head, d_model n_kv n_q_per_kv d_head -> B Qlen d_model ",
 )
-print(compare_tensors(x + attn_out_prime, intermediates["attn_out_mixed"][i]))
 x += attn_out_prime
+print(compare_tensors(x, intermediates["attn_out_mixed"][i]))
 # %%
-
-nx = rms_norm(x) * (1.0 + ln2)
+nx = rms_norm(x) * ln2
 jax.debug.print(
     "pre ffw norm alignment = {b}",
     b=compare_tensors(nx, intermediates["pre_ffw_norm"][i]),
 )
-
-# realigning
-# nx = intermediates['pre_ffw_norm'][i]
-
+# %%
 gate_proj = einsum(nx, w_gate, "B L M, M F -> B L F")
+print(compare_tensors(gate_proj, intermediates["gate_proj"][i]))
+
+# %%
 up_proj = einsum(nx, w_up, "B L M, M F -> B L F")
-y = jax.nn.gelu(gate_proj) * up_proj
+print(compare_tensors(up_proj, intermediates["up_proj"][i]))
+# %%
+y = jax.nn.silu(gate_proj) * up_proj
 ffn_out = einsum(y, w_down, "B L F, M F -> B L M")
 jax.debug.print(
-    "ffn_out alignment = {b}", b=compare_tensors(ffn_out, intermediates["mlp"][i])
+    "ffn_out alignment = {b}",
+    b=compare_tensors(ffn_out, intermediates["ffn_output"][i]),
 )
-
-# realigning
-# ffn_out = intermediates['mlp'][i]
-ffn_out = rms_norm(ffn_out) * (1.0 + post_ffn_ln)
-jax.debug.print(
-    "post_ffw_norm alignment = {b}",
-    b=(compare_tensors(ffn_out, intermediates["post_ffw_norm"][i])),
-)
-
-# realigning
-ffn_out = intermediates["post_ffw_norm"][i]
+# %%
 x += ffn_out
-
-print("final carry dtype \n", x.dtype)
+compare_tensors(x, intermediates["block_out"][i])
 
 # %%
 for i in range(h.layers):
