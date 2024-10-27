@@ -117,18 +117,24 @@ def precompute_freqs_cis(
 ):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device, dtype=torch.float32)
-    if use_scaled:
-        freqs = apply_scaling(freqs)
+    # if use_scaled:
+    #     freqs = apply_scaling(freqs)
     freqs = torch.outer(t, freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+
+    # only difference is this is split into sin, cos in ropetable
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+
     return freqs_cis
 
 
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
+    # equivalent to the rearrange in our rope table
     ndim = x.ndim
     assert 0 <= 1 < ndim
     assert freqs_cis.shape == (x.shape[1], x.shape[-1])
     shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    # [0 1 2 ... ndim-1 ndim]
+    # [1 d 1 ... d    1]
     return freqs_cis.view(*shape)
 
 
@@ -137,6 +143,7 @@ def apply_rotary_emb(
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    # split last dim in 2
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
     freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
@@ -250,14 +257,17 @@ class Attention(nn.Module):
             1, 2
         )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-        hook_fn("scores", scores)
+        hook_fn("logits", scores)
 
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+        hook_fn("probs", scores)
+
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+        hook_fn("attn_out", output)
+
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-        hook_fn("output", output)
         return self.wo(output)
 
 
@@ -332,7 +342,10 @@ class TransformerBlock(nn.Module):
         nx = self.attention_norm(x)
         hook_fn("nx", nx)
         h = x + self.attention(nx, start_pos, freqs_cis, mask)
-        out = h + self.feed_forward(self.ffn_norm(h))
+        hook_fn("attn_out_mixed", h)
+        nx = self.ffn_norm(h)
+        hook_fn("pre_ffw_norm", nx)
+        out = h + self.feed_forward(nx)
         return out
 
 
