@@ -21,11 +21,9 @@ os.environ["XLA_FLAGS"] = (
 model_path = "/Users/clankur/.llama/checkpoints/Llama3.2-1B/"
 with open(f"{model_path}/params.json", "r") as f:
     params = json.load(f)
-
-params
-
-# %%
 model_args = ModelArgs(**params)
+params
+# %%
 # %%
 reload(llama_model)
 model = Transformer(model_args)
@@ -269,21 +267,12 @@ K_MASK = -2.3819763e38
 causal_mask = jnp.tril(jnp.ones((batch_size, L, L), dtype=jnp.bool_), 0)[
     ..., jnp.newaxis, jnp.newaxis, :
 ]
-# local_mask = jnp.triu(jnp.ones((batch_size, L, L), dtype=jnp.bool_), 1 - h.window_size)[
-#     ..., jnp.newaxis, jnp.newaxis, :
-# ]
 
 # %%
 dummy_input = np.zeros((batch_size, seq_length))
 jnp_dummy_input = dummy_input.astype(jnp.int32)
 torch_dummy_input = torch.from_numpy(dummy_input).long()
-
 rope_table = RopeTable(max_len * 2, h)
-# %%
-rope_table.freqs_cis.shape, model.freqs_cis.shape, compare_tensors(
-    rope_table.freqs_cis.astype(jnp.complex64), model.freqs_cis
-)
-
 # %%
 output, intermediates = model.forward(torch_dummy_input, 0)
 output, intermediates
@@ -292,24 +281,24 @@ i = 0
 ids = jnp_dummy_input
 x = embed[ids]
 freqs_cis = rope_table.freqs_cis[:seq_length]
-print(compare_tensors(x, intermediates["tracked_embed"][0]))
+print(compare_tensors(x, intermediates["tracked_embed"][i]))
 
 # def loop_body(carry, layer_weights):
 w_q, w_kv, w_o, w_gate, w_up, w_down, ln1, ln2 = (
-    attn_qs[0],
-    attn_kvs[0],
-    attn_os[0],
-    mlp_gates[0],
-    mlp_ups[0],
-    mlp_downs[0],
-    pre_attention_norms[0],
-    pre_ffw_norms[0],
+    attn_qs[i],
+    attn_kvs[i],
+    attn_os[i],
+    mlp_gates[i],
+    mlp_ups[i],
+    mlp_downs[i],
+    pre_attention_norms[i],
+    pre_ffw_norms[i],
 )
 
 # %%
-print(intermediates["pre_attn_norm"][0].shape)
+print(intermediates["pre_attn_norm"][i].shape)
 nx = rms_norm(x) * ln1
-print(compare_tensors(nx, intermediates["pre_attn_norm"][0].float()))
+print(compare_tensors(nx, intermediates["pre_attn_norm"][i].float()))
 
 # %%
 w_q_compare = rearrange(
@@ -337,13 +326,13 @@ q_compare = rearrange(
 print(
     compare_tensors(
         q_compare,
-        intermediates["xq"][0].float(),
+        intermediates["xq"][i].float(),
     ),
 )
 print(
     compare_tensors(
         k,
-        intermediates["xk"][0].float(),
+        intermediates["xk"][i].float(),
     ),
 )
 
@@ -421,16 +410,14 @@ compare_tensors(x, intermediates["block_out"][i])
 # %%
 for i in range(h.layers):
     layer_weights = [
-        m_w_q[i],
-        m_w_kv[i],
-        m_w_o[i],
-        m_w_gate[i],
-        m_w_up[i],
-        m_w_down[i],
-        m_ln1[i],
-        m_ln2[i],
-        m_post_attn_ln[i],
-        m_post_ffn_ln[i],
+        attn_qs[i],
+        attn_kvs[i],
+        attn_os[i],
+        mlp_gates[i],
+        mlp_ups[i],
+        mlp_downs[i],
+        pre_attention_norms[i],
+        pre_ffw_norms[i],
     ]
     (x, use_local_window_attn, i), _ = loop_body(
         (x, use_local_window_attn, i), layer_weights
@@ -440,8 +427,6 @@ x = rms_norm(x) * (1.0 + m_final_layer_norm)
 print(compare_tensors(x, intermediates["final_norm"]))
 logits = einsum(x, embed, "B L M, V M ->B L V")
 print(compare_tensors(logits, intermediates["tracked_unembed"]))
-logits = jnp.tanh(logits / h.final_softcap) * h.final_softcap
-print(compare_tensors(logits, intermediates["final_softcap"]))
 
 
 # %%

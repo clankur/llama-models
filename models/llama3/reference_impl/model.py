@@ -340,12 +340,13 @@ class TransformerBlock(nn.Module):
         mask: Optional[torch.Tensor],
     ):
         nx = self.attention_norm(x)
-        hook_fn("nx", nx)
+        hook_fn("pre_attn_norm", nx)
         h = x + self.attention(nx, start_pos, freqs_cis, mask)
         hook_fn("attn_out_mixed", h)
         nx = self.ffn_norm(h)
         hook_fn("pre_ffw_norm", nx)
         out = h + self.feed_forward(nx)
+        hook_fn("block_out", out)
         return out
 
 
@@ -410,5 +411,7 @@ class Transformer(nn.Module):
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
         h = self.norm(h)
+        hook_fn("final_norm", h)
         output = self.output(h).float()
+        hook_fn("tracked_unembed", output)
         return output, intermediates
