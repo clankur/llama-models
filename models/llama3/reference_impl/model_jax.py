@@ -252,7 +252,7 @@ class RopeTable:
         freqs_cis = rearrange(self.freqs_cis, rearrange_spec)[
             :, start_pos : start_pos + x.shape[1], ...
         ]
-        x_complex = x1 + x2 * 1j
+        x_complex = x1 * 1j + x2
         print(f"{x_complex.shape=}")
 
         x_out = x_complex * freqs_cis
