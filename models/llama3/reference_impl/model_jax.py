@@ -244,18 +244,27 @@ class RopeTable:
 
         self.sin = jnp.sin(sinusoid_inp)
         self.cos = jnp.cos(sinusoid_inp)
-        self.freqs_cis = jnp.ones_like(sinusoid_inp) * (
-            jnp.cos(sinusoid_inp) + 1j * jnp.sin(sinusoid_inp)
-        )
+        self.freqs_cis = jnp.ones_like(sinusoid_inp) * (self.cos + 1j * self.sin)
 
-    def apply(self, rearrange_spec, x):
+    def apply(self, rearrange_spec, x, start_pos=0):
+        print(f"{x.shape=}")
         x1, x2 = jnp.split(x, 2, axis=-1)
-        # sin = rearrange(self.sin, rearrange_spec)
-        # cos = rearrange(self.cos, rearrange_spec)
+        freqs_cis = rearrange(self.freqs_cis, rearrange_spec)[
+            :, start_pos : start_pos + x.shape[1], ...
+        ]
+        x_complex = x1 + x2 * 1j
+        print(f"{x_complex.shape=}")
+
+        x_out = x_complex * freqs_cis
+        print(f"{x_out.shape=}")
+
+        # sin = rearrange(self.sin, rearrange_spec)[:, : x.shape[1], ...]
+        # cos = rearrange(self.cos, rearrange_spec)[:, : x.shape[1], ...]
         # r1 = x1 * cos - x2 * sin
         # r2 = x2 * cos + x1 * sin
-
-        return jnp.concatenate([r1, r2], axis=-1).astype(x.dtype)
+        x_out = jnp.stack([jnp.real(x_out), jnp.imag(x_out)], axis=-1).astype(x.dtype)
+        print(f"{x_out.shape=}")
+        return jnp.reshape(x_out, (*x_out.shape[:-2], -1))
 
 
 # %%
@@ -272,13 +281,13 @@ K_MASK = -2.3819763e38
 
 # %%
 batch_size = 1
-seq_length = 2048  # tokens.targets.shape[-1]
-
+seq_length = 5  # tokens.targets.shape[-1]
+max_len = 2048
 dummy_input = np.zeros((batch_size, seq_length))
 jnp_dummy_input = dummy_input.astype(jnp.int32)
 torch_dummy_input = torch.from_numpy(dummy_input).long()
 
-rope_table = RopeTable(2048 * 2, h)
+rope_table = RopeTable(max_len * 2, h)
 # %%
 rope_table.freqs_cis.shape, model.freqs_cis.shape, compare_tensors(
     rope_table.freqs_cis.astype(jnp.float32), model.freqs_cis.float()
@@ -291,6 +300,7 @@ output, intermediates
 i = 0
 ids = jnp_dummy_input
 x = embed[ids]
+freqs_cis = rope_table.freqs_cis[:seq_length]
 print(compare_tensors(x, intermediates["tracked_embed"][0]))
 
 # def loop_body(carry, layer_weights):
@@ -347,9 +357,9 @@ print(
 )
 
 # %%
-
 q = rope_table.apply("L d -> 1 L 1 1 d", q)
 k = rope_table.apply("L d -> 1 L 1 d", k)
+# %%
 q_compare = rearrange(
     q, "B Qlen n_kv n_q_per_kv d_head -> B Qlen (n_kv n_q_per_kv) d_head"
 )
@@ -358,7 +368,6 @@ print(compare_tensors(k, intermediates["xk_roped"][i]))
 
 q_preatt_scalar = h.d_head**-0.5
 q_scaled = q * q_preatt_scalar
-
 
 # %%
 
