@@ -247,24 +247,15 @@ class RopeTable:
         self.freqs_cis = jnp.ones_like(sinusoid_inp) * (self.cos + 1j * self.sin)
 
     def apply(self, rearrange_spec, x, start_pos=0):
-        print(f"{x.shape=}")
-        x1, x2 = jnp.split(x, 2, axis=-1)
+        x_complex = jnp.reshape(x.astype(jnp.float32), (*x.shape[:-1], -1, 2))
+
+        x_complex = x_complex[0] + x_complex[1] * 1j
         freqs_cis = rearrange(self.freqs_cis, rearrange_spec)[
             :, start_pos : start_pos + x.shape[1], ...
         ]
-        x_complex = x1 * 1j + x2
-        print(f"{x_complex.shape=}")
-
         x_out = x_complex * freqs_cis
-        print(f"{x_out.shape=}")
-
-        # sin = rearrange(self.sin, rearrange_spec)[:, : x.shape[1], ...]
-        # cos = rearrange(self.cos, rearrange_spec)[:, : x.shape[1], ...]
-        # r1 = x1 * cos - x2 * sin
-        # r2 = x2 * cos + x1 * sin
         x_out = jnp.stack([jnp.real(x_out), jnp.imag(x_out)], axis=-1).astype(x.dtype)
-        print(f"{x_out.shape=}")
-        return jnp.reshape(x_out, (*x_out.shape[:-2], -1))
+        return jnp.reshape(x_out, (*x_out.shape[:-2], -1)).astype(x)
 
 
 # %%
@@ -290,9 +281,14 @@ torch_dummy_input = torch.from_numpy(dummy_input).long()
 rope_table = RopeTable(max_len * 2, h)
 # %%
 rope_table.freqs_cis.shape, model.freqs_cis.shape, compare_tensors(
+    rope_table.freqs_cis.astype(jnp.complex64), model.freqs_cis
+)
+# %%
+print("resetting freqs cis")
+rope_table.freqs_cis = jnp.from_dlpack(asdlpack(model.freqs_cis))
+rope_table.freqs_cis.shape, model.freqs_cis.shape, compare_tensors(
     rope_table.freqs_cis.astype(jnp.float32), model.freqs_cis.float()
 )
-
 # %%
 output, intermediates = model.forward(torch_dummy_input, 0)
 output, intermediates
@@ -355,6 +351,35 @@ print(
         intermediates["xk"][0].float(),
     ),
 )
+# %%
+q_torch = intermediates["xq"][0].float().contiguous()
+q_jax = jnp.array(q_torch.numpy(), copy=True)
+# %%
+q_complex_jax = jnp.reshape(q_jax.astype(jnp.float32), (*q_jax.shape[:-1], -1, 2))
+q_complex_jax = q_complex_jax[..., 0] + q_complex_jax[..., 1] * 1j
+q_complex_torch = torch.view_as_complex(
+    q_torch.float().reshape(*q_torch.shape[:-1], -1, 2)
+)
+q_complex_jax.shape, q_complex_torch.shape, compare_tensors(
+    q_complex_jax, q_complex_torch
+)
+# %%
+from model import reshape_for_broadcast
+
+local_freqs_cis_torch = model.freqs_cis[:seq_length]
+local_freqs_cis_jax = jnp.from_dlpack(asdlpack(local_freqs_cis_torch))
+local_freqs_cis_torch = reshape_for_broadcast(local_freqs_cis_torch, q_complex_torch)
+local_freqs_cis_jax = rearrange(local_freqs_cis_jax, "L d -> 1 L 1 d")
+compare_tensors(q_complex_jax, q_complex_torch)
+# %%
+q_out_torch = torch.view_as_real(q_complex_torch * local_freqs_cis_torch).flatten(3)
+q_out_jax = q_complex_jax * local_freqs_cis_jax
+q_out_jax = jnp.stack([jnp.real(q_out_jax), jnp.imag(q_out_jax)], axis=-1).astype(
+    x.dtype
+)
+q_out_jax = jnp.reshape(q_out_jax, (*q_out_jax.shape[:-2], -1)).astype(x)
+compare_tensors(q_out_jax, q_out_torch)
+
 
 # %%
 q = rope_table.apply("L d -> 1 L 1 1 d", q)
@@ -370,7 +395,6 @@ q_preatt_scalar = h.d_head**-0.5
 q_scaled = q * q_preatt_scalar
 
 # %%
-
 logits = einsum(
     q_scaled,
     k,
