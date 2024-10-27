@@ -132,7 +132,7 @@ def load_llama(weights, h: Hparams):
         )
         w_o = rearrange(
             w_o,
-            "(n_q_per_kv n_kv d_head) d_model -> d_model n_q_per_kv n_kv d_head",
+            "d_model (n_kv n_q_per_kv d_head) -> d_model n_kv n_q_per_kv d_head",
             n_q_per_kv=h.n_q_per_kv,
             n_kv=h.n_kv,
             d_head=h.d_head,
@@ -259,21 +259,21 @@ class RopeTable:
 
 
 # %%
+batch_size = 1
+seq_length = 5  # tokens.targets.shape[-1]
+max_len = 2048
 L = 5
 h = Hparams()
 K_MASK = -2.3819763e38
-# use_local_window_attn = False
-# causal_mask = jnp.tril(jnp.ones((batch_size, L, L), dtype=jnp.bool_), 0)[
-#     ..., jnp.newaxis, jnp.newaxis, :
-# ]
+# %%
+causal_mask = jnp.tril(jnp.ones((batch_size, L, L), dtype=jnp.bool_), 0)[
+    ..., jnp.newaxis, jnp.newaxis, :
+]
 # local_mask = jnp.triu(jnp.ones((batch_size, L, L), dtype=jnp.bool_), 1 - h.window_size)[
 #     ..., jnp.newaxis, jnp.newaxis, :
 # ]
 
 # %%
-batch_size = 1
-seq_length = 5  # tokens.targets.shape[-1]
-max_len = 2048
 dummy_input = np.zeros((batch_size, seq_length))
 jnp_dummy_input = dummy_input.astype(jnp.int32)
 torch_dummy_input = torch.from_numpy(dummy_input).long()
@@ -283,12 +283,7 @@ rope_table = RopeTable(max_len * 2, h)
 rope_table.freqs_cis.shape, model.freqs_cis.shape, compare_tensors(
     rope_table.freqs_cis.astype(jnp.complex64), model.freqs_cis
 )
-# %%
-print("resetting freqs cis")
-rope_table.freqs_cis = jnp.from_dlpack(asdlpack(model.freqs_cis))
-rope_table.freqs_cis.shape, model.freqs_cis.shape, compare_tensors(
-    rope_table.freqs_cis.astype(jnp.float32), model.freqs_cis.float()
-)
+
 # %%
 output, intermediates = model.forward(torch_dummy_input, 0)
 output, intermediates
@@ -370,79 +365,37 @@ logits = einsum(
     k,
     "B Qlen n_kv n_q_per_kv d_head, B Klen n_kv d_head -> B Qlen n_kv n_q_per_kv Klen",
 )
-logits = jnp.tanh(logits / h.attn_softcap) * h.attn_softcap
 logits_test = rearrange(
-    logits, "B Qlen n_kv n_q_per_kv Klen -> B Qlen (n_kv n_q_per_kv) Klen"
+    logits, "B Qlen n_kv n_q_per_kv Klen -> B (n_kv n_q_per_kv) Qlen Klen"
 )
-jax.debug.print(
-    "capped logits alignment={b}",
-    b=compare_tensors(logits_test, intermediates["capped_logits"][i]),
-)
-
-attn_mask = jax.lax.select(
-    use_local_window_attn,
-    jnp.logical_and(causal_mask, local_mask),
-    causal_mask,
-)
-logits = jnp.where(attn_mask, logits, -2.3819763e38)
-logits_test = rearrange(
-    logits, "B Qlen n_kv n_q_per_kv Klen -> B Qlen (n_kv n_q_per_kv) Klen"
-)
-jax.debug.print(
-    "masked logits alignment={b}",
-    b=compare_tensors(logits_test, intermediates["masked_logits"][i]),
-)
-
+print(compare_tensors(logits_test, intermediates["logits"][i]))
+logits_test.shape, intermediates["logits"][i].shape
+logits = jnp.where(causal_mask, logits, -2.3819763e38)
+# %%
 probs = jax.nn.softmax(logits, axis=-1).astype(x.dtype)
 probs_test = rearrange(
-    probs, "B Qlen n_kv n_q_per_kv Klen -> B Qlen (n_kv n_q_per_kv) Klen"
+    probs, "B Qlen n_kv n_q_per_kv Klen -> B (n_kv n_q_per_kv) Qlen Klen"
 )
-jax.debug.print(
-    "att wei alignment={b}",
-    b=compare_tensors(probs_test, intermediates["att_wei"][i]),
+print(
+    compare_tensors(probs_test, intermediates["probs"][i]),
 )
-
-encoded = einsum(
+probs_test.shape, intermediates["probs"][i].shape
+# %%
+attn_out = einsum(
     probs,
     v,
     "B Qlen n_kv n_q_per_kv Klen, B Klen n_kv d_head -> B Qlen n_kv n_q_per_kv d_head",
 )
 
-encoded = rearrange(
-    encoded, "B Qlen n_kv n_q_per_kv d_head -> B Qlen (n_kv n_q_per_kv) d_head"
+attn_out_prime = einsum(
+    attn_out,
+    w_o,
+    "B Qlen n_kv n_q_per_kv d_head, d_model n_kv n_q_per_kv d_head -> B Qlen d_model ",
 )
+print(compare_tensors(x + attn_out_prime, intermediates["attn_out_mixed"][i]))
+x += attn_out_prime
+# %%
 
-# jax.debug.print("attn_out before MHA mix aligned: {b}", b=compare_tensors(
-#     encoded, intermediates['a_out_premix'][i]))
-
-# realigning
-encoded = intermediates["a_out_premix"][i]
-
-# for some reason: mixing mha is wrong here...
-# attn_out = einsum(
-#     encoded, w_o, "B Qlen n_head d_head, n_head d_head d_model  -> B Qlen d_model"
-# )
-# but correct here:
-attn_out = jnp.einsum("BTNH,NHD->BTD", encoded, w_o)
-
-jax.debug.print(
-    "attn_out after w_o alignment: {b}",
-    b=compare_tensors(attn_out, intermediates["a_out"][i]),
-)
-
-# realigning
-# attn_out = intermediates['a_out'][i]
-
-attn_out = rms_norm(attn_out) * (1.0 + post_attn_ln)
-jax.debug.print(
-    "post attn norm alignment = {b}",
-    b=compare_tensors(attn_out, intermediates["post_attention_norm"][i]),
-)
-
-# realigning
-attn_out = intermediates["post_attention_norm"][i]
-
-x += attn_out
 nx = rms_norm(x) * (1.0 + ln2)
 jax.debug.print(
     "pre ffw norm alignment = {b}",
