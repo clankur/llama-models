@@ -351,35 +351,6 @@ print(
         intermediates["xk"][0].float(),
     ),
 )
-# %%
-q_torch = intermediates["xq"][0].float().contiguous()
-q_jax = jnp.array(q_torch.numpy(), copy=True)
-# %%
-q_complex_jax = jnp.reshape(q_jax.astype(jnp.float32), (*q_jax.shape[:-1], -1, 2))
-q_complex_jax = q_complex_jax[..., 0] + q_complex_jax[..., 1] * 1j
-q_complex_torch = torch.view_as_complex(
-    q_torch.float().reshape(*q_torch.shape[:-1], -1, 2)
-)
-q_complex_jax.shape, q_complex_torch.shape, compare_tensors(
-    q_complex_jax, q_complex_torch
-)
-# %%
-from model import reshape_for_broadcast
-
-local_freqs_cis_torch = model.freqs_cis[:seq_length]
-local_freqs_cis_jax = jnp.from_dlpack(asdlpack(local_freqs_cis_torch))
-local_freqs_cis_torch = reshape_for_broadcast(local_freqs_cis_torch, q_complex_torch)
-local_freqs_cis_jax = rearrange(local_freqs_cis_jax, "L d -> 1 L 1 d")
-compare_tensors(q_complex_jax, q_complex_torch)
-# %%
-q_out_torch = torch.view_as_real(q_complex_torch * local_freqs_cis_torch).flatten(3)
-q_out_jax = q_complex_jax * local_freqs_cis_jax
-q_out_jax = jnp.stack([jnp.real(q_out_jax), jnp.imag(q_out_jax)], axis=-1).astype(
-    x.dtype
-)
-q_out_jax = jnp.reshape(q_out_jax, (*q_out_jax.shape[:-2], -1)).astype(x)
-compare_tensors(q_out_jax, q_out_torch)
-
 
 # %%
 q = rope_table.apply("L d -> 1 L 1 1 d", q)
