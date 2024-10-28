@@ -155,7 +155,6 @@ def load_llama(weights, h: Hparams):
         )
         mlp_downs.append(w_down)
 
-    # Stack all lists along the first dimension (number of layers)
     pre_attention_norms = jnp.stack(pre_attention_norms, axis=0)
     pre_ffw_norms = jnp.stack(pre_ffw_norms, axis=0)
     attn_qs = jnp.stack(attn_qs, axis=0)
@@ -202,8 +201,6 @@ def compare_tensors(
     tensor2: jax.Array | torch.Tensor,
     tolerance: float = 1e-4,
 ) -> tuple[bool, bool]:
-    # Convert the torch tensor to a jax array
-
     tensor1 = torch.from_dlpack(asdlpack(tensor1))
     tensor2 = torch.from_dlpack(asdlpack(tensor2))
 
@@ -249,9 +246,10 @@ class RopeTable:
         x_complex = jnp.reshape(x.astype(jnp.float32), (*x.shape[:-1], -1, 2))
 
         x_complex = x_complex[..., 0] + x_complex[..., 1] * 1j
-        freqs_cis = rearrange(self.freqs_cis, rearrange_spec)[
-            :, start_pos : start_pos + x.shape[1], ...
-        ]
+        freqs_cis = rearrange(
+            self.freqs_cis[start_pos : start_pos + x.shape[1]], rearrange_spec
+        )
+
         x_out = x_complex * freqs_cis
         x_out = jnp.stack([jnp.real(x_out), jnp.imag(x_out)], axis=-1).astype(x.dtype)
         return jnp.reshape(x_out, (*x_out.shape[:-2], -1)).astype(x)
@@ -264,7 +262,6 @@ max_len = 2048
 L = 5
 h = Hparams()
 K_MASK = -2.3819763e38
-# %%
 causal_mask = jnp.tril(jnp.ones((batch_size, L, L), dtype=jnp.bool_), 0)[
     ..., jnp.newaxis, jnp.newaxis, :
 ]
@@ -277,58 +274,27 @@ rope_table = RopeTable(max_len * 2, h)
 # %%
 output, intermediates = model.forward(torch_dummy_input, 0)
 output, intermediates
-# %%
-i = 0
-ids = jnp_dummy_input
-x = embed[ids]
-freqs_cis = rope_table.freqs_cis[:seq_length]
-print(compare_tensors(x, intermediates["tracked_embed"][i]))
 
 
 # %%
 def loop_body(carry, layer_weights):
     x, i = carry
     w_q, w_kv, w_o, w_gate, w_up, w_down, ln1, ln2 = layer_weights
-    # print(f"layer {i}")
     nx = rms_norm(x) * ln1
-    # print(
-    #     "pre_attn_norm", compare_tensors(nx, intermediates["pre_attn_norm"][i].float())
-    # )
-
     q = einsum(
         nx,
-        w_q,  # torch.from_dlpack(asdlpack
+        w_q,
         "B Qlen d_model, n_kv n_q_per_kv d_head d_model -> B Qlen n_kv n_q_per_kv d_head",
     )
     k, v = einsum(
         nx, w_kv, "B Klen d_model, k_v d_model n_kv d_head -> k_v B Klen n_kv d_head"
     ).astype(x)
 
-    q_compare = rearrange(
-        q, "B Qlen n_kv n_q_per_kv d_head -> B Qlen (n_kv n_q_per_kv) d_head"
-    )
-    # print(
-    #     "q",
-    #     compare_tensors(
-    #         q_compare,
-    #         intermediates["xq"][i].float(),
-    #     ),
-    # )
-    # print(
-    #     "k",
-    #     compare_tensors(
-    #         k,
-    #         intermediates["xk"][i].float(),
-    #     ),
-    # )
-
     q = rope_table.apply("L d -> 1 L 1 1 d", q)
     k = rope_table.apply("L d -> 1 L 1 d", k)
     q_compare = rearrange(
         q, "B Qlen n_kv n_q_per_kv d_head -> B Qlen (n_kv n_q_per_kv) d_head"
     )
-    # print("q_roped", compare_tensors(q_compare, intermediates["xq_roped"][i]))
-    # print("k", compare_tensors(k, intermediates["xk_roped"][i]))
 
     q_preatt_scalar = h.d_head**-0.5
     q_scaled = q * q_preatt_scalar
@@ -341,15 +307,13 @@ def loop_body(carry, layer_weights):
     logits_test = rearrange(
         logits, "B Qlen n_kv n_q_per_kv Klen -> B (n_kv n_q_per_kv) Qlen Klen"
     )
-    # print(compare_tensors(logits_test, intermediates["logits"][i]))
+
     logits = jnp.where(causal_mask, logits, -2.3819763e38)
     probs = jax.nn.softmax(logits, axis=-1).astype(x.dtype)
     probs_test = rearrange(
         probs, "B Qlen n_kv n_q_per_kv Klen -> B (n_kv n_q_per_kv) Qlen Klen"
     )
-    # print(
-    #     compare_tensors(probs_test, intermediates["probs"][i]),
-    # )
+
     attn_out = einsum(
         probs,
         v,
@@ -362,72 +326,25 @@ def loop_body(carry, layer_weights):
         "B Qlen n_kv n_q_per_kv d_head, d_model n_kv n_q_per_kv d_head -> B Qlen d_model ",
     )
     x += attn_out_prime
-    # print(compare_tensors(x, intermediates["attn_out_mixed"][i]))
 
     nx = rms_norm(x) * ln2
-    # print(
-    #     f"pre ffw norm alignment = {compare_tensors(nx, intermediates['pre_ffw_norm'][i])}",
-    # )
 
     gate_proj = einsum(nx, w_gate, "B L M, M F -> B L F")
-    # print(
-    #     "gate_proj alignment", compare_tensors(gate_proj, intermediates["gate_proj"][i])
-    # )
-
-    # up_proj = einsum(
-    #     torch.from_dlpack(asdlpack(nx)),
-    #     torch.from_dlpack(asdlpack(w_up)),
-    #     "B L M, M F -> B L F",
-    # )
     up_proj = jnp.einsum("blm,mf->blf", nx, w_up, precision=jax.lax.Precision.HIGHEST)
 
-    # print("up_proj alignment", compare_tensors(up_proj, intermediates["up_proj"][i]))
-
     y = jax.nn.silu(gate_proj) * up_proj
-    # ffn_out = einsum(y, w_down, "B L F, M F -> B L M")
     ffn_out = jnp.einsum("blf,mf->blm", y, w_down, precision=jax.lax.Precision.HIGHEST)
-    # ffn_out = einsum(
-    #     torch.from_dlpack(asdlpack(y)),
-    #     torch.from_dlpack(asdlpack(w_down)),
-    #     "B L F, M F -> B L M",
-    # )
-
-    # print(
-    #     f"ffn_out alignment = {compare_tensors(ffn_out, intermediates['ffn_output'][i])}"
-    # )
-    # ffn_out = jnp.array(intermediates["ffn_output"][i].numpy())
     x += ffn_out
-    # print("block_out", compare_tensors(x, intermediates["block_out"][i]))
-    # print("\n")
 
     return (x, i), ()
-
-
-# %%
-for i in range(h.layers):
-    layer_weights = [
-        attn_qs[i],
-        attn_kvs[i],
-        attn_os[i],
-        mlp_gates[i],
-        mlp_ups[i],
-        mlp_downs[i],
-        pre_attention_norms[i],
-        pre_ffw_norms[i],
-    ]
-    (x, i), _ = loop_body((x, i), layer_weights)
-
-# %%
-x = rms_norm(x) * final_norm
-print(compare_tensors(x, intermediates["final_norm"][0]))
-logits = einsum(x, embed, "B L M, V M ->B L V")
-print(compare_tensors(logits, intermediates["tracked_unembed"][0]))
 
 
 # %%
 i = 0
 ids = jnp_dummy_input
 x = embed[ids]
+freqs_cis = rope_table.freqs_cis[:seq_length]
+print(compare_tensors(x, intermediates["tracked_embed"][i]))
 (x, i), () = jax.lax.scan(
     loop_body,
     (x, i),
@@ -446,6 +363,4 @@ x = rms_norm(x) * (final_norm)
 print(compare_tensors(x, intermediates["final_norm"][0]))
 logits = einsum(x, embed, "B L M, V M ->B L V")
 print(compare_tensors(logits, intermediates["tracked_unembed"][0]))
-
-
 # %%
