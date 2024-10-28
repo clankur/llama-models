@@ -117,8 +117,9 @@ def precompute_freqs_cis(
 ):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device, dtype=torch.float32)
-    # if use_scaled:
-    #     freqs = apply_scaling(freqs)
+    if use_scaled:
+        print("using scaling")
+        freqs = apply_scaling(freqs)
     freqs = torch.outer(t, freqs)
 
     # only difference is this is split into sin, cos in ropetable

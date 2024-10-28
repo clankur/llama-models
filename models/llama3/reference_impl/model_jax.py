@@ -51,6 +51,7 @@ class Hparams:
     d_ff: int = hidden_dim
     rope_max_timescale: int = model_args.rope_theta
     norm_eps: float = model_args.norm_eps
+    use_scale: bool = model_args.use_scaled_rope
 
 
 # %%
@@ -228,19 +229,43 @@ def rms_norm(x):
 class RopeTable:
     def __init__(self, max_len: int, h: Hparams) -> None:
         head_dim = h.d_head
-        timescale = 1.0 / (
-            h.rope_max_timescale
-            ** (jnp.arange(0, head_dim, 2)[: (head_dim // 2)] / head_dim)
-        )
+        fraction = jnp.arange(0, head_dim, 2)[: (head_dim // 2)] / head_dim
+        timescale = h.rope_max_timescale**fraction
+
         position = jnp.arange(max_len, dtype=jnp.float32)
         # need to add scaling to 1.0/timescale here
-
+        if h.use_scale:
+            timescale = self._apply_scaling_factor(1.0 / timescale)
         # sinusoid_inp = jnp.float32(position[:, jnp.newaxis]) / timescale[jnp.newaxis, :]
         sinusoid_inp = jnp.outer(position, timescale)
 
         self.sin = jnp.sin(sinusoid_inp)
         self.cos = jnp.cos(sinusoid_inp)
         self.freqs_cis = jnp.ones_like(sinusoid_inp) * (self.cos + 1j * self.sin)
+
+    def _apply_scaling_factor(self, freqs):
+        scale_factor = 8
+        low_freq_factor = 1
+        high_freq_factor = 4
+        old_context_len = 8192  # original llama3 length
+
+        low_freq_wavelen = old_context_len / low_freq_factor
+        high_freq_wavelen = old_context_len / high_freq_factor
+
+        new_freqs = []
+        for freq in freqs:
+            wavelen = 2 * jnp.pi / freq
+            if wavelen < high_freq_wavelen:
+                new_freqs.append(freq)
+            elif wavelen > low_freq_wavelen:
+                new_freqs.append(freq / scale_factor)
+            else:
+                assert low_freq_wavelen != high_freq_wavelen
+                smooth = (old_context_len / wavelen - low_freq_factor) / (
+                    high_freq_factor - low_freq_factor
+                )
+                new_freqs.append((1 - smooth) * freq / scale_factor + smooth * freq)
+        return jnp.array(new_freqs, dtype=freqs.dtype)
 
     def apply(self, rearrange_spec, x, start_pos=0):
         x_complex = jnp.reshape(x.astype(jnp.float32), (*x.shape[:-1], -1, 2))
@@ -271,6 +296,11 @@ dummy_input = np.zeros((batch_size, seq_length))
 jnp_dummy_input = dummy_input.astype(jnp.int32)
 torch_dummy_input = torch.from_numpy(dummy_input).long()
 rope_table = RopeTable(max_len * 2, h)
+
+# %%
+rope_table.freqs_cis.shape, model.freqs_cis.shape, compare_tensors(
+    rope_table.freqs_cis.astype(jnp.complex64), model.freqs_cis
+)
 # %%
 output, intermediates = model.forward(torch_dummy_input, 0)
 output, intermediates
@@ -289,13 +319,18 @@ def loop_body(carry, layer_weights):
     k, v = einsum(
         nx, w_kv, "B Klen d_model, k_v d_model n_kv d_head -> k_v B Klen n_kv d_head"
     ).astype(x)
+    q_compare = rearrange(
+        q, "B Qlen n_kv n_q_per_kv d_head -> B Qlen (n_kv n_q_per_kv) d_head"
+    )
+    print("q", compare_tensors(q_compare, intermediates["xq"][i]))
 
     q = rope_table.apply("L d -> 1 L 1 1 d", q)
     k = rope_table.apply("L d -> 1 L 1 d", k)
     q_compare = rearrange(
         q, "B Qlen n_kv n_q_per_kv d_head -> B Qlen (n_kv n_q_per_kv) d_head"
     )
-
+    print("q_roped", compare_tensors(q_compare, intermediates["xq_roped"][i]))
+    print("k", compare_tensors(k, intermediates["xk_roped"][i]))
     q_preatt_scalar = h.d_head**-0.5
     q_scaled = q * q_preatt_scalar
 
@@ -338,6 +373,31 @@ def loop_body(carry, layer_weights):
 
     return (x, i), ()
 
+
+# %%
+i = 0
+ids = jnp_dummy_input
+x = embed[ids]
+freqs_cis = rope_table.freqs_cis[:seq_length]
+print(compare_tensors(x, intermediates["tracked_embed"][i]))
+
+for i in range(h.layers):
+    layer_weights = [
+        attn_qs[i],
+        attn_kvs[i],
+        attn_os[i],
+        mlp_gates[i],
+        mlp_ups[i],
+        mlp_downs[i],
+        pre_attention_norms[i],
+        pre_ffw_norms[i],
+    ]
+    (x, i), _ = loop_body((x, i), layer_weights)
+# %%
+x = rms_norm(x) * final_norm
+print(compare_tensors(x, intermediates["final_norm"][0]))
+logits = einsum(x, embed, "B L M, V M ->B L V")
+print(compare_tensors(logits, intermediates["tracked_unembed"][0]))
 
 # %%
 i = 0
