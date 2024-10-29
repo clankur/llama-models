@@ -231,12 +231,10 @@ class RopeTable:
         head_dim = h.d_head
         fraction = jnp.arange(0, head_dim, 2)[: (head_dim // 2)] / head_dim
         timescale = h.rope_max_timescale**fraction
-
         position = jnp.arange(max_len, dtype=jnp.float32)
-        # need to add scaling to 1.0/timescale here
+
         if h.use_scale:
             timescale = self._apply_scaling_factor(1.0 / timescale)
-        # sinusoid_inp = jnp.float32(position[:, jnp.newaxis]) / timescale[jnp.newaxis, :]
         sinusoid_inp = jnp.outer(position, timescale)
 
         self.sin = jnp.sin(sinusoid_inp)
@@ -322,15 +320,13 @@ def loop_body(carry, layer_weights):
     q_compare = rearrange(
         q, "B Qlen n_kv n_q_per_kv d_head -> B Qlen (n_kv n_q_per_kv) d_head"
     )
-    print("q", compare_tensors(q_compare, intermediates["xq"][i]))
 
     q = rope_table.apply("L d -> 1 L 1 1 d", q)
     k = rope_table.apply("L d -> 1 L 1 d", k)
     q_compare = rearrange(
         q, "B Qlen n_kv n_q_per_kv d_head -> B Qlen (n_kv n_q_per_kv) d_head"
     )
-    print("q_roped", compare_tensors(q_compare, intermediates["xq_roped"][i]))
-    print("k", compare_tensors(k, intermediates["xk_roped"][i]))
+
     q_preatt_scalar = h.d_head**-0.5
     q_scaled = q * q_preatt_scalar
 
@@ -343,7 +339,7 @@ def loop_body(carry, layer_weights):
         logits, "B Qlen n_kv n_q_per_kv Klen -> B (n_kv n_q_per_kv) Qlen Klen"
     )
 
-    logits = jnp.where(causal_mask, logits, -2.3819763e38)
+    logits = jnp.where(causal_mask, logits, K_MASK)
     probs = jax.nn.softmax(logits, axis=-1).astype(x.dtype)
     probs_test = rearrange(
         probs, "B Qlen n_kv n_q_per_kv Klen -> B (n_kv n_q_per_kv) Qlen Klen"
@@ -373,31 +369,6 @@ def loop_body(carry, layer_weights):
 
     return (x, i), ()
 
-
-# %%
-i = 0
-ids = jnp_dummy_input
-x = embed[ids]
-freqs_cis = rope_table.freqs_cis[:seq_length]
-print(compare_tensors(x, intermediates["tracked_embed"][i]))
-
-for i in range(h.layers):
-    layer_weights = [
-        attn_qs[i],
-        attn_kvs[i],
-        attn_os[i],
-        mlp_gates[i],
-        mlp_ups[i],
-        mlp_downs[i],
-        pre_attention_norms[i],
-        pre_ffw_norms[i],
-    ]
-    (x, i), _ = loop_body((x, i), layer_weights)
-# %%
-x = rms_norm(x) * final_norm
-print(compare_tensors(x, intermediates["final_norm"][0]))
-logits = einsum(x, embed, "B L M, V M ->B L V")
-print(compare_tensors(logits, intermediates["tracked_unembed"][0]))
 
 # %%
 i = 0
