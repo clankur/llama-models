@@ -234,14 +234,14 @@ class RopeTable:
         position = jnp.arange(max_len, dtype=jnp.float32)
 
         if h.use_scale:
-            timescale = self._apply_scaling_factor(1.0 / timescale)
+            timescale = jax.vmap(self._apply_scaling_factor)(1.0 / timescale)
         sinusoid_inp = jnp.outer(position, timescale)
 
         self.sin = jnp.sin(sinusoid_inp)
         self.cos = jnp.cos(sinusoid_inp)
         self.freqs_cis = jnp.ones_like(sinusoid_inp) * (self.cos + 1j * self.sin)
 
-    def _apply_scaling_factor(self, freqs):
+    def _apply_scaling_factor(self, freq):
         scale_factor = 8
         low_freq_factor = 1
         high_freq_factor = 4
@@ -249,21 +249,30 @@ class RopeTable:
 
         low_freq_wavelen = old_context_len / low_freq_factor
         high_freq_wavelen = old_context_len / high_freq_factor
+        wavelen = 2 * jnp.pi / freq
 
-        new_freqs = []
-        for freq in freqs:
-            wavelen = 2 * jnp.pi / freq
-            if wavelen < high_freq_wavelen:
-                new_freqs.append(freq)
-            elif wavelen > low_freq_wavelen:
-                new_freqs.append(freq / scale_factor)
-            else:
-                assert low_freq_wavelen != high_freq_wavelen
+        def lower_wavelen(freq):
+            return freq
+
+        def bigger_or_equal_wavelen(freq):
+            def bigger_wavelen(freq):
+                return freq / scale_factor
+
+            def equal_wavelen(freq):
                 smooth = (old_context_len / wavelen - low_freq_factor) / (
                     high_freq_factor - low_freq_factor
                 )
-                new_freqs.append((1 - smooth) * freq / scale_factor + smooth * freq)
-        return jnp.array(new_freqs, dtype=freqs.dtype)
+                return (1 - smooth) * freq / scale_factor + smooth * freq
+
+            bigger_wavelen_cond = wavelen > low_freq_wavelen
+            return jax.lax.cond(
+                bigger_wavelen_cond, bigger_wavelen, equal_wavelen, freq
+            )
+
+        lower_wavelen_cond = wavelen < high_freq_wavelen
+        return jax.lax.cond(
+            lower_wavelen_cond, lower_wavelen, bigger_or_equal_wavelen, freq
+        )
 
     def apply(self, rearrange_spec, x, start_pos=0):
         x_complex = jnp.reshape(x.astype(jnp.float32), (*x.shape[:-1], -1, 2))
