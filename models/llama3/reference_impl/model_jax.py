@@ -18,7 +18,7 @@ os.environ["XLA_FLAGS"] = (
 )
 
 # %%
-model_path = "/Users/clankur/.llama/checkpoints/Llama3.2-1B/"
+model_path = os.path.expanduser("~/.llama/checkpoints/Llama3.2-1B/")
 with open(f"{model_path}/params.json", "r") as f:
     params = json.load(f)
 model_args = ModelArgs(**params)
