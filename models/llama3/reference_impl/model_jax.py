@@ -24,7 +24,6 @@ with open(f"{model_path}/params.json", "r") as f:
 model_args = ModelArgs(**params)
 params
 # %%
-# %%
 reload(llama_model)
 model = Transformer(model_args)
 weights = torch.load(
@@ -237,11 +236,14 @@ class RopeTable:
             timescale = jax.vmap(self._apply_scaling_factor)(1.0 / timescale)
         sinusoid_inp = jnp.outer(position, timescale)
 
-        self.sin = jnp.sin(sinusoid_inp)
-        self.cos = jnp.cos(sinusoid_inp)
-        self.freqs_cis = jnp.ones_like(sinusoid_inp) * (self.cos + 1j * self.sin)
+        self.timescale = jnp.ones_like(sinusoid_inp) * (
+            jnp.cos(sinusoid_inp) + 1j * jnp.sin(sinusoid_inp)
+        )
 
     def _apply_scaling_factor(self, freq):
+        # cleaner implementation from maxtext that doesn't require provisioning a list:
+        # https://github.com/AI-Hypercomputer/maxtext/blob/54135f84741728e05fa69950cb70d3d2b1496950/MaxText/layers/embeddings.py#L184-L209
+
         scale_factor = 8
         low_freq_factor = 1
         high_freq_factor = 4
@@ -278,11 +280,11 @@ class RopeTable:
         x_complex = jnp.reshape(x.astype(jnp.float32), (*x.shape[:-1], -1, 2))
 
         x_complex = x_complex[..., 0] + x_complex[..., 1] * 1j
-        freqs_cis = rearrange(
-            self.freqs_cis[start_pos : start_pos + x.shape[1]], rearrange_spec
+        timescale = rearrange(
+            self.timescale[start_pos : start_pos + x.shape[1]], rearrange_spec
         )
 
-        x_out = x_complex * freqs_cis
+        x_out = x_complex * timescale
         x_out = jnp.stack([jnp.real(x_out), jnp.imag(x_out)], axis=-1).astype(x.dtype)
         return jnp.reshape(x_out, (*x_out.shape[:-2], -1)).astype(x)
 
@@ -304,10 +306,6 @@ jnp_dummy_input = dummy_input.astype(jnp.int32)
 torch_dummy_input = torch.from_numpy(dummy_input).long()
 rope_table = RopeTable(max_len * 2, h)
 
-# %%
-rope_table.freqs_cis.shape, model.freqs_cis.shape, compare_tensors(
-    rope_table.freqs_cis.astype(jnp.complex64), model.freqs_cis
-)
 # %%
 output, intermediates = model.forward(torch_dummy_input, 0)
 output, intermediates
@@ -383,7 +381,6 @@ def loop_body(carry, layer_weights):
 i = 0
 ids = jnp_dummy_input
 x = embed[ids]
-freqs_cis = rope_table.freqs_cis[:seq_length]
 print(compare_tensors(x, intermediates["tracked_embed"][i]))
 (x, i), () = jax.lax.scan(
     loop_body,
